@@ -1,354 +1,237 @@
-﻿using System;
-using System.Net;
+﻿using PokemonGo.RocketAPI.Enums;
+using PokemonGo.RocketAPI.Extensions;
+using PokemonGo.RocketAPI.Helpers;
+using PokemonGo.RocketAPI.Rpc;
+using PokemonGoAPI.Session;
+using POGOProtos.Networking.Envelopes;
+using PokemonGoAPI.Interfaces;
 using System.Net.Http;
+using System.Net;
 using System.Threading.Tasks;
 using Google.Protobuf;
-using PokemonGo.RocketAPI.Enums;
-using PokemonGo.RocketAPI.GeneratedCode;
-using PokemonGo.RocketAPI.Helpers;
-using PokemonGo.RocketAPI.Extensions;
-using PokemonGo.RocketAPI.Login;
-using static PokemonGo.RocketAPI.GeneratedCode.Response.Types;
+using PokemonGoAPI.Enums;
+using PokemonGo.RocketAPI.Exceptions;
+using System.Diagnostics;
+using System;
+using Google.Protobuf.Collections;
 
 namespace PokemonGo.RocketAPI
 {
-    public class Client
+    public partial class Client : HttpClient
     {
-        private readonly ISettings _settings;
-        private readonly HttpClient _httpClient;
-        private AuthType _authType = AuthType.Ptc;
-        private string _accessToken;
-        private string _apiUrl;
-        private Request.Types.UnknownAuth _unknownAuth;
-
-        private double _currentLat;
-        private double _currentLng;
-
-        public Client(ISettings settings)
+        private static readonly HttpClientHandler Handler = new HttpClientHandler
         {
-            _settings = settings;
-            SetCoordinates(_settings.DefaultLatitude, _settings.DefaultLongitude);
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+            AllowAutoRedirect = false
+        };
 
-            //Setup HttpClient and create default headers
-            HttpClientHandler handler = new HttpClientHandler()
-            {
-                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-                AllowAutoRedirect = false
-            };
-            _httpClient = new HttpClient(new RetryHandler(handler));
-            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Niantic App");
-                //"Dalvik/2.1.0 (Linux; U; Android 5.1.1; SM-G900F Build/LMY48G)");
-            _httpClient.DefaultRequestHeaders.ExpectContinue = false;
-            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Connection", "keep-alive");
-            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "*/*");
-            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type",
-                "application/x-www-form-urlencoded");
-        }
+        public IDeviceInfo DeviceInfo;
+        public Download Download;
+        public Encounter Encounter;
+        public Fort Fort;
+        public Inventory Inventory;
+        public Rpc.Login Login;
+        public Map Map;
+        public Misc Misc;
+        public Player Player;
 
-        private void SetCoordinates(double lat, double lng)
+        public IApiFailureStrategy ApiFailure { get; set; }
+        public ISettings Settings { get; }
+        public string AuthToken => AccessToken?.Token;
+
+        public double CurrentLatitude { get; internal set; }
+        public double CurrentLongitude { get; internal set; }
+        public double CurrentAccuracy { get; internal set; }
+
+        public AuthType AuthType => Settings.AuthType;
+        internal string ApiUrl { get; set; }
+        internal AuthTicket AuthTicket => AccessToken?.AuthTicket;
+        public AccessToken AccessToken { get; set; }
+
+        #region Constructors
+
+        /// <summary>
+        /// 
+        /// </summary>
+        public Client() : base(new RetryHandler(Handler))
         {
-            _currentLat = lat;
-            _currentLng = lng;
-        }
-
-        public async Task DoGoogleLogin()
-        {
-            _authType = AuthType.Google;
-            if (_settings.GoogleRefreshToken != string.Empty)
-            {
-                var tokenResponse = await GoogleLogin.GetAccessToken(_settings.GoogleRefreshToken);
-                _accessToken = tokenResponse.id_token;
-            }
-            
-            if (_accessToken == null)
-            {
-                var tokenResponse = await GoogleLogin.GetAccessToken();
-                _accessToken = tokenResponse.id_token;
-                _settings.GoogleRefreshToken = tokenResponse.access_token;
-            }
+            DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Niantic App");
+            DefaultRequestHeaders.ExpectContinue = false;
+            DefaultRequestHeaders.TryAddWithoutValidation("Connection", "keep-alive");
+            DefaultRequestHeaders.TryAddWithoutValidation("Accept", "*/*");
+            DefaultRequestHeaders.TryAddWithoutValidation("Content-Type", "application/x-www-form-urlencoded");
         }
 
         /// <summary>
-        /// Returns true if the login worked
+        /// 
         /// </summary>
-        /// <param name="username"></param>
-        /// <param name="password"></param>
-        /// <returns></returns>
-        public async Task<string> DoPtcLogin(string username, string password)
-        {            
-            Logger.Write("Starting PTC login");
-            _accessToken = await PtcLogin.GetAccessToken(username, password);
-            _authType = AuthType.Ptc;
-            await SetServer();
-            Logger.Write("PTC login completed (" + !string.IsNullOrEmpty(_accessToken) + ")");
-            return _accessToken;
+        /// <param name="settings"></param>
+        /// <param name="apiFailureStrategy"></param>
+        /// <param name="deviceInfo"></param>
+        /// <param name="accessToken"></param>
+        public Client(ISettings settings, IApiFailureStrategy apiFailureStrategy, IDeviceInfo deviceInfo, AccessToken accessToken = null) : this()
+        {
+            Settings = settings;
+            ApiFailure = apiFailureStrategy;
+            AccessToken = accessToken;
+
+            Login = new Rpc.Login(this);
+            Player = new Player(this);
+            Download = new Download(this);
+            Inventory = new Inventory(this);
+            Map = new Map(this);
+            Fort = new Fort(this);
+            Encounter = new Encounter(this);
+            Misc = new Misc(this);
+            DeviceInfo = deviceInfo;
+
+            Player.SetCoordinates(Settings.DefaultLatitude, Settings.DefaultLongitude, Settings.DefaultAccuracy);
         }
 
-        public async Task<PlayerUpdateResponse> UpdatePlayerLocation(double lat, double lng)
+        #endregion
+
+        #region HttpClient stuff
+
+        public async Task<IMessage[]> PostProtoPayload<TRequest>(string url, RequestEnvelope requestEnvelope, IApiFailureStrategy strategy, 
+            params Type[] responseTypes)
+            where TRequest : IMessage<TRequest>
         {
-            SetCoordinates(lat, lng);
-            var customRequest = new Request.Types.PlayerUpdateProto()
+            var result = new IMessage[responseTypes.Length];
+            for (var i = 0; i < responseTypes.Length; i++)
             {
-                Lat = Utils.FloatAsUlong(_currentLat),
-                Lng = Utils.FloatAsUlong(_currentLng)
-            };
-
-            var updateRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 10,
-                new Request.Types.Requests()
+                result[i] = Activator.CreateInstance(responseTypes[i]) as IMessage;
+                if (result[i] == null)
                 {
-                    Type = (int)RequestType.PLAYER_UPDATE,
-                    Message = customRequest.ToByteString()
-                });
-            var updateResponse =
-                await
-                    _httpClient.PostProtoPayload<Request, PlayerUpdateResponse>($"https://{_apiUrl}/rpc", updateRequest);
-            return updateResponse;
-        }
+                    throw new ArgumentException($"ResponseType {i} is not an IMessage");
+                }
+            }
+            var urlArray = new[] { url };
+            ResponseEnvelope response;
 
-        public async Task SetServer(string authToken = null)
-        {
-            if (authToken != null) _accessToken = authToken;
-            var serverRequest = RequestBuilder.GetInitialRequest(_accessToken, _authType, _currentLat, _currentLng, 10,
-                RequestType.GET_PLAYER, RequestType.GET_HATCHED_OBJECTS, RequestType.GET_INVENTORY,
-                RequestType.CHECK_AWARDED_BADGES, RequestType.DOWNLOAD_SETTINGS);
-            var serverResponse = await _httpClient.PostProto(Resources.RpcUrl, serverRequest);
-            _unknownAuth = new Request.Types.UnknownAuth()
+            while ((response = await PostProto<TRequest>(urlArray[0], requestEnvelope)).Returns.Count !=
+                   responseTypes.Length)
             {
-                Unknown71 = serverResponse.Auth.Unknown71,
-                Timestamp = serverResponse.Auth.Timestamp,
-                Unknown73 = serverResponse.Auth.Unknown73,
-            };
+                var operation = await strategy.HandleApiFailure(urlArray, requestEnvelope, response);
+                if (operation == ApiOperation.Abort)
+                {
+                    throw new InvalidResponseException(
+                        $"Expected {responseTypes.Length} responses, but got {response.Returns.Count} responses");
+                }
+            }
 
-            _apiUrl = serverResponse.ApiUrl;
-        }
+            strategy.HandleApiSuccess(requestEnvelope, response);
 
-        public async Task<GetPlayerResponse> GetProfile()
-        {
-            var profileRequest = RequestBuilder.GetInitialRequest(_accessToken, _authType, _currentLat, _currentLng, 10,
-                new Request.Types.Requests() { Type = (int)RequestType.GET_PLAYER });
-            return await _httpClient.PostProtoPayload<Request, GetPlayerResponse>($"https://{_apiUrl}/rpc", profileRequest);
-        }
-
-        public async Task<DownloadSettingsResponse> GetSettings()
-        {
-            var settingsRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 10,
-                RequestType.DOWNLOAD_SETTINGS);
-            return await _httpClient.PostProtoPayload<Request, DownloadSettingsResponse>($"https://{_apiUrl}/rpc", settingsRequest);
-        }
-
-        public async Task<DownloadItemTemplatesResponse> GetItemTemplates()
-        {
-            var settingsRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 10,
-                RequestType.DOWNLOAD_ITEM_TEMPLATES);
-            return
-                await
-                    _httpClient.PostProtoPayload<Request, DownloadItemTemplatesResponse>($"https://{_apiUrl}/rpc",
-                        settingsRequest);
-        }
-
-
-
-        public async Task<GetMapObjectsResponse> GetMapObjects()
-        {
-            var customRequest = new Request.Types.MapObjectsRequest()
+            for (var i = 0; i < responseTypes.Length; i++)
             {
-                CellIds =
-                    ByteString.CopyFrom(
-                        ProtoHelper.EncodeUlongList(S2Helper.GetNearbyCellIds(_currentLng,
-                            _currentLat))),
-                Latitude = Utils.FloatAsUlong(_currentLat),
-                Longitude = Utils.FloatAsUlong(_currentLng),
-                Unknown14 = ByteString.CopyFromUtf8("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")
-            };
-
-            var mapRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 10,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.GET_MAP_OBJECTS,
-                    Message = customRequest.ToByteString()
-                },
-                new Request.Types.Requests() { Type = (int)RequestType.GET_HATCHED_OBJECTS },
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.GET_INVENTORY,
-                    Message = new Request.Types.Time() { Time_ = DateTime.UtcNow.ToUnixTime() }.ToByteString()
-                },
-                new Request.Types.Requests() { Type = (int)RequestType.CHECK_AWARDED_BADGES },
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.DOWNLOAD_SETTINGS,
-                    Message =
-                        new Request.Types.SettingsGuid()
-                        {
-                            Guid = ByteString.CopyFromUtf8("4a2e9bc330dae60e7b74fc85b98868ab4700802e")
-                        }.ToByteString()
-                });
-
-            return await _httpClient.PostProtoPayload<Request, GetMapObjectsResponse>($"https://{_apiUrl}/rpc", mapRequest);
+                var payload = response.Returns[i];
+                result[i].MergeFrom(payload);
+            }
+            return result;
         }
 
-        public async Task<FortDetailsResponse> GetFort(string fortId, double fortLat, double fortLng)
+        public async Task<TResponsePayload> PostProtoPayload<TRequest, TResponsePayload>(string url, RequestEnvelope requestEnvelope, IApiFailureStrategy strategy)
+            where TRequest : IMessage<TRequest>
+            where TResponsePayload : IMessage<TResponsePayload>, new()
         {
-            var customRequest = new Request.Types.FortDetailsRequest()
+            Debug.WriteLine($"Requesting {typeof(TResponsePayload).Name}");
+            var urlArray = new[] { url };
+
+            var response = await PostProto<TRequest>(url, requestEnvelope);
+
+            while (response.Returns.Count == 0)
             {
-                Id = ByteString.CopyFromUtf8(fortId),
-                Latitude = Utils.FloatAsUlong(fortLat),
-                Longitude = Utils.FloatAsUlong(fortLng),
-            };
-
-            var fortDetailRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 10,
-                new Request.Types.Requests()
+                var operation = await strategy.HandleApiFailure(urlArray, requestEnvelope, response);
+                if (operation == ApiOperation.Abort)
                 {
-                    Type = (int)RequestType.FORT_DETAILS,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, FortDetailsResponse>($"https://{_apiUrl}/rpc", fortDetailRequest);
+                    break;
+                }
+
+                response = await PostProto<TRequest>(urlArray[0], requestEnvelope);
+            }
+
+            // TODO: statuscode = 3 probably means ban!
+            if (response.Returns.Count == 0)
+                throw new InvalidResponseException();
+
+            strategy.HandleApiSuccess(requestEnvelope, response);
+
+            //Decode payload
+            //todo: multi-payload support
+            var payload = response.Returns[0];
+            var parsedPayload = new TResponsePayload();
+            parsedPayload.MergeFrom(payload);
+
+            return parsedPayload;
         }
 
-        public async Task<FortSearchResponse> SearchFort(string fortId, double fortLat, double fortLng)
+        public async Task<ResponseEnvelope> PostProto<TRequest>(string url, RequestEnvelope requestEnvelope) 
+            where TRequest : IMessage<TRequest>
         {
-            var customRequest = new Request.Types.FortSearchRequest()
+            // robertmclaws: Let's be pro-active about token failures, instead of reactive.
+            if (AccessToken == null || AccessToken.IsExpired)
             {
-                Id = ByteString.CopyFromUtf8(fortId),
-                FortLatDegrees = Utils.FloatAsUlong(fortLat),
-                FortLngDegrees = Utils.FloatAsUlong(fortLng),
-                PlayerLatDegrees = Utils.FloatAsUlong(_currentLat),
-                PlayerLngDegrees = Utils.FloatAsUlong(_currentLng)
-            };
+                await Login.DoLogin();
+            }
 
-            var fortDetailRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.FORT_SEARCH,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, FortSearchResponse>($"https://{_apiUrl}/rpc", fortDetailRequest);
+            //Encode payload and put in envelop, then send
+            var data = requestEnvelope.ToByteString();
+            var result = await PostAsync(url, new ByteArrayContent(data.ToByteArray())).ConfigureAwait(false);
+
+            //Decode message
+            var responseData = await result.Content.ReadAsByteArrayAsync();
+            var codedStream = new CodedInputStream(responseData);
+            var decodedResponse = new ResponseEnvelope();
+            decodedResponse.MergeFrom(codedStream);
+
+            return decodedResponse;
         }
 
-        public async Task<EncounterResponse> EncounterPokemon(ulong encounterId, string spawnPointGuid)
+        #endregion
+
+        #region API 2.0 bridge
+
+        // For smoother migration to 2.0
+
+
+        // Conversion from obsolete Tuple
+        internal bool ProcessMessages<T1, T2, T3, T4, T5, T6>(Tuple<T1, T2, T3, T4, T5, T6> tuple)
+            where T1 : class, IMessage, new()
+            where T2 : class, IMessage, new()
+            where T3 : class, IMessage, new()
+            where T4 : class, IMessage, new()
+            where T5 : class, IMessage, new()
+            where T6 : class, IMessage, new()
         {
-            var customRequest = new Request.Types.EncounterRequest()
+            IMessage[] msgs = new IMessage[] { tuple.Item1, tuple.Item2, tuple.Item3, tuple.Item4, tuple.Item5, tuple.Item6 };
+            return ProcessMessages(msgs);
+        }
+
+        // Conversion from obsolete Tuple
+        internal bool ProcessMessages<T1, T2>(Tuple<T1, T2> tuple)
+            where T1 : class, IMessage, new()
+            where T2 : class, IMessage, new()
+        {
+            IMessage[] msgs = new IMessage[] { tuple.Item1, tuple.Item2};
+            return ProcessMessages(msgs);
+        }
+
+        internal bool ProcessMessages(RepeatedField<ByteString> responses, params Type[] responseTypes)
+        {
+            IMessage[] msgs = new IMessage[responses.Count];
+
+            for (var i = 0; i < responseTypes.Length; i++)
             {
-                EncounterId = encounterId,
-                SpawnpointId = spawnPointGuid,
-                PlayerLatDegrees = Utils.FloatAsUlong(_currentLat),
-                PlayerLngDegrees = Utils.FloatAsUlong(_currentLng)
-            };
+                msgs[i] = Activator.CreateInstance(responseTypes[i]) as IMessage;
 
-            var encounterResponse = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.ENCOUNTER,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, EncounterResponse>($"https://{_apiUrl}/rpc", encounterResponse);
+                var payload = responses[i];
+                msgs[i].MergeFrom(payload);
+            }
+
+            return ProcessMessages(msgs);
         }
 
-        public async Task<UseItemCaptureRequest> UseCaptureItem(ulong encounterId, AllEnum.ItemId itemId, string spawnPointGuid)
-        {
-            var customRequest = new UseItemCaptureRequest
-            {
-                EncounterId = encounterId,
-                ItemId = itemId,
-                SpawnPointGuid = spawnPointGuid
-            };
+    #endregion
 
-            var useItemRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.USE_ITEM_CAPTURE,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, UseItemCaptureRequest>($"https://{_apiUrl}/rpc", useItemRequest);
-        }
+}
 
-        public async Task<CatchPokemonResponse> CatchPokemon(ulong encounterId, string spawnPointGuid, double pokemonLat,
-            double pokemonLng, MiscEnums.Item pokeball)
-        {
-            // Randomized a little bit to avoid always perfect shots (#12)
-            var reticleSize = Utils.FloatAsUlong(RandomHelper.GetFloatRandom(0, 1.950f));
-            var spinModifier = Utils.FloatAsUlong(RandomHelper.GetFloatRandom(0, 1));
-            var hitPosition = Utils.FloatAsUlong(1); //Utils.FloatAsUlong(RandomHelper.GetFloatRandom(0, 1));
-
-            var customRequest = new Request.Types.CatchPokemonRequest()
-            {
-                EncounterId = encounterId,
-                Pokeball = (int)pokeball,
-                SpawnPointGuid = spawnPointGuid,
-                HitPokemon = 1,
-                NormalizedReticleSize = reticleSize, //Utils.FloatAsUlong(1.950),
-                SpinModifier = spinModifier, //Utils.FloatAsUlong(1),
-                NormalizedHitPosition = hitPosition, //Utils.FloatAsUlong(1)
-            };
-
-            Logger.Write($"Trying to catch with parameters {customRequest.NormalizedReticleSize}, {customRequest.SpinModifier}, {customRequest.NormalizedHitPosition}");
-
-            var catchPokemonRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.CATCH_POKEMON,
-                    Message = customRequest.ToByteString()
-                });
-            return
-                await
-                    _httpClient.PostProtoPayload<Request, CatchPokemonResponse>($"https://{_apiUrl}/rpc", catchPokemonRequest);
-        }
-
-        public async Task<TransferPokemonOut> TransferPokemon(ulong pokemonId)
-        {
-            var customRequest = new TransferPokemon
-            {
-                PokemonId = pokemonId
-            };
-
-            var releasePokemonRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.RELEASE_POKEMON,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, TransferPokemonOut>($"https://{_apiUrl}/rpc", releasePokemonRequest);
-        }
-
-        public async Task<EvolvePokemonOut> EvolvePokemon(ulong pokemonId)
-        {
-            var customRequest = new EvolvePokemon
-            {
-                PokemonId = pokemonId
-            };
-
-            var releasePokemonRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.EVOLVE_POKEMON,
-                    Message = customRequest.ToByteString()
-                });
-            return
-                await
-                    _httpClient.PostProtoPayload<Request, EvolvePokemonOut>($"https://{_apiUrl}/rpc", releasePokemonRequest);
-        }
-
-        public async Task<GetInventoryResponse> GetInventory()
-        {
-            var inventoryRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30, RequestType.GET_INVENTORY);
-            return await _httpClient.PostProtoPayload<Request, GetInventoryResponse>($"https://{_apiUrl}/rpc", inventoryRequest);
-        }
-
-        public async Task<RecycleInventoryItemResponse> RecycleItem(AllEnum.ItemId itemId, int amount)
-        {
-            var customRequest = new InventoryItemData.RecycleInventoryItem
-            {
-                ItemId = (AllEnum.ItemId)Enum.Parse(typeof(AllEnum.ItemId), itemId.ToString()),
-                Count = amount
-            };
-
-            var releasePokemonRequest = RequestBuilder.GetRequest(_unknownAuth, _currentLat, _currentLng, 30,
-                new Request.Types.Requests()
-                {
-                    Type = (int)RequestType.RECYCLE_INVENTORY_ITEM,
-                    Message = customRequest.ToByteString()
-                });
-            return await _httpClient.PostProtoPayload<Request, RecycleInventoryItemResponse>($"https://{_apiUrl}/rpc", releasePokemonRequest);
-        }
-    }
 }
